@@ -1,137 +1,100 @@
 ####################################################################
-## Single-experiment alpha-lattice mixed model
-## Maize accessions | 2 REPs | incomplete BLOCKs | BLUPs of true
-## genotypic performance (one environment/trial only)
+## Multi-environment alpha-lattice mixed model analysis
+## Dataset: ComBLUPSdata
+## Factors (as named in your data): GENOTYPE, ENV, REP, BLOCK
+## Traits (as named in your data): POLLEN, SILK, ASI, PLHT, EHT, STYG,
+##   PASP, HUSKC, RLPERC, SLPERC, EPP, EASP, EROT, YIELD
+## Goal: genotypic BLUPs (across environments) for all 14 traits
 ####################################################################
 
-## ---- 0. Packages -------------------------------------------------
-# install.packages(c("lme4","lmerTest","tidyverse","sommer","pbkrtest","emmeans", "dplyr"))
+## ---- 0. Packages ---------------------------------------------------
+# Run install.packages() lines ONCE only if not already installed —
+# no need to reinstall every session, only re-library() them.
+# install.packages(c("tidyverse","lme4","lmerTest","sommer","broom.mixed","emmeans","clipr"))
 
-install.packages("pbkrtest")
-install.packages("sommer")
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(sommer)
+library(broom.mixed)
+library(emmeans)
+library(clipr)
 
-#Load installed packages
+## ---- 1. Import and prepare data ------------------------------------
 
-library(tidyverse) #
-library(lme4)      # For fitting linear mixed-effects models
-library(lmerTest)  # For p-values and ANOVA tables
-library(sommer)    #
-library(dplyr)     # For data manipulation
-library(clipr)     # For moving data copyied in excel to Import Data into R
-library(emmeans)   # print means
-library(pbkrtest)  # 
-library(dplyr)     # Called to hep use the 'select' function sitting in dplyr only
+ComBLUPSdata <- clipr::read_clip_tbl()   # or: read_csv("your_file.csv")
 
-# ==============================================================================
-#Import Data
-#===============================================================================
-## ---- 1. Expected data structure -----------------------------------
-# One row per plot, single trial only:
-#   REP      - factor, 2 levels
-#   BLOCK    - incomplete BLOCK factor, nested in REP
-#   GENOTYPE - factor, one level per accession
-# Trait1..TraitN - numeric trait columns
-# If BLOCK numbers REPeat across REPs (e.g., both REPs have BLOCKs 1-9),
-# make the BLOCK ID unique within REP first:
-# SingleBLUPSdata$BLOCK <- factor(paste(SingleBLUPSdata$REP, SingleBLUPSdata$BLOCK, sep = "_"))
-#------------------------------------------------------------------------
+str(ComBLUPSdata)   # confirm columns look right before proceeding
 
-##=================================================================
-##Import Data by copying from clipboard
-#-------------------------------------
-SingleBLUPSdata = clipr::read_clip_tbl()
-# REPlace 'SingleBLUPSdata' with your dataset name if different
-# Ensure factors are correctly set as categorical variables:
-str(SingleBLUPSdata)
-SingleBLUPSdata$REP = as.factor(SingleBLUPSdata$REP)
-SingleBLUPSdata$BLOCK = as.factor(SingleBLUPSdata$BLOCK)
-SingleBLUPSdata$GENOTYPE = as.factor(SingleBLUPSdata$GENOTYPE)
+stopifnot(all(c("GENOTYPE","ENV","REP","BLOCK") %in% colnames(ComBLUPSdata)))
 
-# i. Rename factors first (if not already done) as it's in the Dataset
-SingleBLUPSdata <- SingleBLUPSdata %>%
-  rename(Genotype = GENOTYPE, Block = BLOCK, Rep = REP) %>%
+ComBLUPSdata <- ComBLUPSdata %>%
   mutate(
-    Rep      = factor(Rep),
-    Block    = factor(paste(Rep, Block, sep = "_")),
-    Genotype = factor(Genotype)
-  )
-  
-trait_names <- c("POLLEN", "SILK", "ASI", "PLHT", "EHT", "STYG", "PASP", "HUSKC",
-                  "RLPERC", "SLPERC", "EPP", "EASP", "EROT", "YIELD")
-#trait_names <- stores that list of your real trait-column names/counts in an object called trait_names.
-# — this code doesn't care how many traits are in the vector 
-# and it's just a list the rest of the script loops over later.
-
-##========================================================================
-# OR import Data from csv file
-#-------------------------------------
-SingleBLUPSdata <- read_csv("filename for the_single_trial_data.csv") %>%
-  mutate(
-    REP      = factor(REP),
-    BLOCK    = factor(paste(REP, BLOCK, sep = "_")),
+    ENV      = factor(ENV),
+    REP      = factor(paste(ENV, REP, sep = "_")),           # REP unique within ENV
+    BLOCK    = factor(paste(ENV, REP, BLOCK, sep = "_")),    # BLOCK unique within REP(ENV)
     GENOTYPE = factor(GENOTYPE)
   )
+
 trait_names <- c("POLLEN", "SILK", "ASI", "PLHT", "EHT", "STYG", "PASP", "HUSKC",
-                 "RLPERC", "SLPERC", "EPP", "EASP", "EROT", "YIELD")
-#trait_names <- stores that list of your real trait-column names/counts in an object called trait_names.
-# — this code doesn't care how many traits are in the vector 
-# and it's just a list the rest of the script loops over later (map(trait_names, ...)) 
-# so the same model gets fit once per trait automatically, instead of you writing out 14 separate BLOCKs of code.
+                  "RLPERC", "SLPERC", "EPP", "EASP", "EROT", "YIELD")
 
-
-###################################################################
-## 2. Fit the alpha-lattice model per trait
 ####################################################################
-## Standard single-trial alpha-lattice model for BLUPs:
-##   y = mu + REP + (1|BLOCK:REP) + (1|GENOTYPE) + e
-## REP is typically fixed (for this analysis it's only 2 levels, and REPs REPresent as fixed BLOCKing factor of the design rather than a random sample of REPs).
-## BLOCK within REP is random (recovers inter-BLOCK information).
-## GENOTYPE is random -> BLUPs (shrunken toward the overall mean).
+## APPROACH A: lme4 — combined (multi-environment) alpha-lattice model
+####################################################################
+## Model per trait, across all environments simultaneously:
+##   y = mu + ENV + (1|REP) + (1|BLOCK) + (1|GENOTYPE) + (1|GENOTYPE:ENV)
+##
+## Design choices:
+##  - ENV fixed (few levels; usually too few to estimate a variance
+##    component reliably as random)
+##  - REP within ENV: random (as intended by design)
+##  - Incomplete BLOCK within REP within ENV: random (recovers
+##    inter-block information)
+##  - GENOTYPE: random -> gives shrunken BLUPs
+##  - GENOTYPE:ENV: random -> captures GxE, needed for stable
+##    across-environment BLUPs
 
-# ii. Re-run the function definition (unchanged, but make sure it's the current version)
-fit_one_trait <- function(trait, data) {
-  f <- as.formula(paste0(trait, " ~ Rep + (1|Block) + (1|Genotype)"))
+fit_lmer_one_trait <- function(trait, data) {
+  f <- as.formula(
+    paste0(trait, " ~ ENV + (1|REP) + (1|BLOCK) + (1|GENOTYPE) + (1|GENOTYPE:ENV)")
+  )
   lmer(f, data = data, REML = TRUE,
-       control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+       control = lmerControl(optimizer = "bobyqa",
+                              optCtrl = list(maxfun = 2e5)))
 }
 
-# iii. REFIT all 14 models using the renamed data
-lmer_fits <- map(trait_names, ~ fit_one_trait(.x, SingleBLUPSdata)) %>%
+lmer_fits <- map(trait_names, ~ fit_lmer_one_trait(.x, ComBLUPSdata)) %>%
   set_names(trait_names)
 
-# Summary of variance components
-summary(fit_one_trait)
-summary(lmer_fits)
-
-# Check convergence / singular fits before trusting any results
+# Convergence check — inspect before trusting any downstream results
 convergence_check <- tibble(
   Trait = trait_names,
   singular = map_lgl(lmer_fits, isSingular),
   messages = map_chr(lmer_fits, ~ paste(.x@optinfo$conv$lme4$messages, collapse = "; "))
 )
 print(convergence_check)
-# A trait with singular = TRUE usually means BLOCK (or GENOTYPE) variance
-# were estimated at ~0 — check whether blocking helped that trait at all
-# (compare against a simpler RCBD-style model without BLOCK via AIC).
 
 ####################################################################
-## 3. Extract GENOTYPE BLUPs
+## Extract genotype BLUPs (across-environment genotypic performance)
 ####################################################################
 
 get_genotype_blups <- function(model, trait) {
   intercept <- fixef(model)[["(Intercept)"]]
-  rep_fx <- fixef(model)[grepl("^Rep", names(fixef(model)))]
-  rep_mean_adj <- mean(c(0, rep_fx))
-  
-  re <- ranef(model, condVar = TRUE)$Genotype
+  # mean ENV fixed-effect contribution, so BLUPs represent an
+  # across-environment genotype mean rather than the reference ENV level
+  env_fx <- fixef(model)[grepl("^ENV", names(fixef(model)))]
+  env_mean_adj <- mean(c(0, env_fx))
+
+  re <- ranef(model, condVar = TRUE)$GENOTYPE
   pv <- attr(re, "postVar")
   se <- sqrt(pv[1, 1, ])
-  
+
   tibble(
     Genotype = rownames(re),
     Trait = trait,
     BLUP_deviation = re[, 1],
-    BLUP = intercept + rep_mean_adj + re[, 1],
+    BLUP_value = intercept + env_mean_adj + re[, 1],
     SE = se
   )
 }
@@ -139,470 +102,121 @@ get_genotype_blups <- function(model, trait) {
 genotype_blups_all <- map2_dfr(lmer_fits, trait_names, get_genotype_blups)
 
 genotype_blups_wide <- genotype_blups_all %>%
-dplyr::select(Genotype, Trait, BLUP) %>%
-pivot_wider(names_from = Trait, values_from = BLUP)
+  dplyr::select(Genotype, Trait, BLUP_value) %>%
+  pivot_wider(names_from = Trait, values_from = BLUP_value)
 
-### Quick check to confirm it looks right before moving on:
-# Call column 'Genotype' in 'genotype_blups_all'.
-colnames(genotype_blups_all)
-dim(genotype_blups_wide)   # should be ~72 rows (genotypes) x 15 columns (Genotype + 14 traits)
-head(genotype_blups_wide)  # peek at the first few rows
-
-#Save to CSV:
-write_csv(genotype_blups_wide, "genotype_BLUPs_single_trial_wide.csv")
-write_csv(genotype_blups_all,  "genotype_BLUPs_single_trial_long.csv")
-
-# Locate file on laptop
-getwd()
+write_csv(genotype_blups_wide, "genotype_BLUPs_wide.csv")
+write_csv(genotype_blups_all,  "genotype_BLUPs_long.csv")
 
 ####################################################################
-## 4. Variance components + heritability + Repeatability
+## Variance components + broad-sense heritability (per trait)
 ####################################################################
-## Two heritability estimates are given:
-##  (i)  "Standard" broad-sense heritability on an entry-mean basis:
-##         H2 = Vg / (Vg + Ve/r)
-##       Simple, widely reorted, but assumes a balanced design.
-
-#==Script to use for the Standard-only version
-n_rep <- nlevels(SingleBLUPSdata$Rep)
-
-get_h2_standard_only <- function(model, trait) {
-  vc <- as.data.frame(VarCorr(model))
-  Vg <- vc$vcov[vc$grp == "Genotype"]
-  Vb <- vc$vcov[vc$grp == "Block"]
-  Ve <- attr(VarCorr(model), "sc")^2
-  H2_standard <- Vg / (Vg + Ve / n_rep)
-  
-  tibble(Trait = trait, Vg = Vg, Vblock = Vb, Ve = Ve, H2_standard = H2_standard)
-}
-
-##  (ii) Cullis et al. (2006) generalized heritability — more appropriate
-##       for alpha-lattice / unbalanced designs where PEV varies by
-##       GENOTYPE (some Genotypes are better connected across Blocks
-##       than others):
-##         H2_Cullis = 1 - (mean_vdBLUP / (2 * Vg))
-##       where mean_vdBLUP is the mean pairwise prediction error variance
-##       of the GENOTYPE BLUP differences, approximated here as
-##       2 * mean(PEV_i) under the standard independence approximation.
-
-#==Script to use for the Cullis-only version:
-n_rep <- nlevels(SingleBLUPSdata$Rep)
-
-get_h2_cullis_only <- function(model, trait, blups) {
-  vc <- as.data.frame(VarCorr(model))
-  Vg <- vc$vcov[vc$grp == "Genotype"]
-  Vb <- vc$vcov[vc$grp == "Block"]
-  Ve <- attr(VarCorr(model), "sc")^2
-  
-  pev <- blups %>% dplyr::filter(Trait == trait) %>% dplyr::pull(SE) %>% {.^2}
-  mean_vdBLUP <- 2 * mean(pev)
-  H2_cullis <- 1 - (mean_vdBLUP / (2 * Vg))
-  
-  tibble(Trait = trait, Vg = Vg, Vblock = Vb, Ve = Ve, H2_Cullis = H2_cullis)
-}
-
-#### Running the scripts for both H2 methods in one pass gives 
-#### a table with both H2_standard and H2_Cullis side by side, per trait.
-
-n_rep <- nlevels(SingleBLUPSdata$Rep)
-
-get_varcomp_h2 <- function(model, trait, blups) {
-  vc <- as.data.frame(VarCorr(model))
-  Vg <- vc$vcov[vc$grp == "Genotype"]
-  Vb <- vc$vcov[vc$grp == "Block"]
-  Ve <- attr(VarCorr(model), "sc")^2
-  H2_standard <- Vg / (Vg + Ve / n_rep)
-  
-  pev <- blups %>% dplyr::filter(Trait == trait) %>% dplyr::pull(SE) %>% {.^2}
-  mean_vdBLUP <- 2 * mean(pev)
-  H2_cullis <- 1 - (mean_vdBLUP / (2 * Vg))
-  
-  tibble(Trait = trait, Vg = Vg, Vblock = Vb, Ve = Ve,
-         H2_standard = H2_standard, H2_Cullis = H2_cullis)
-}
-
-# Run the function for H2 methods above as-is, then just use/report whichever 
-# column you prefer from the output:This gives you a table 
-# with both H2_standard and H2_Cullis side by side, per trait.
-varcomp_summary <- map2_dfr(lmer_fits, trait_names,
-                            ~ get_varcomp_h2(.x, .y, genotype_blups_all))
-write_csv(varcomp_summary, "variance_components_H2_single_trial.csv")
-print(varcomp_summary)
-
-
-####################################################################
-## Repeatability for the multi-environment (combined) BLUPs
-## Run AFTER the MET script (needs: ComBLUPSdata, varcomp_summary,
-## n_env, n_rep already built, library(tidyverse))
-####################################################################
-## Repeatability vs heritability — the distinction:
-##  - Heritability (H2) asks: what proportion of phenotypic variance
-##    among genotypes is genetic?
-##  - Repeatability (R) asks: how consistent is the SAME genotype's
-##    measured performance across its repeated observations (here,
-##    across the 2 reps)? In a single-trial context like this, R is
-##    calculated the same way but is more naturally interpreted as
-##    "how reliably would I get the same ranking if I repeated this
-##    trial layout again" — useful for traits measured with any
-##    subjectivity/noise (e.g., visual scores) or before deciding
-##    how many reps you'd need in a future trial.
-####################################################################
-## Same repeatability concept as the single-trial version, extended
-## to account for the extra layers present in a multi-environment
-## trial: GENOTYPE:ENV interaction and BLOCK/REP nested within ENV.
-##
-## Two versions, matching the single-trial script's structure:
-##  (a) Plot-basis (single-observation) repeatability — treats one
-##      plot record, in one environment, as "one observation":
-##        R_plot = Vg / (Vg + Vge + Vblock + Vrep + Ve)
-##  (b) Entry-mean-basis repeatability — treats a genotype's overall
-##      multi-environment mean (averaged over all envs, reps, and
-##      blocks it appeared in) as "one observation":
-##        R_mean = Vg / (Vg + Vge/n_env + Vblock/(n_env*n_block)
-##                          + Ve/(n_env*n_rep))
-##      This mirrors H2_broad_sense already computed in
-##      varcomp_summary, but additionally accounts for block variance
-##      rather than ignoring it — same relationship as in the
-##      single-trial script between R_entry_mean and H2_standard.
-
-## ---- 0. Make sure required objects exist ---------------------------
-if (!exists("varcomp_summary")) {
-  stop("Run the MET script's variance-component section first (varcomp_summary) before this script.")
-}
+## H2 (across-environment, entry-mean basis):
+##   H2 = Vg / (Vg + Vge/n_env + Ve/(n_env * n_rep))
 
 n_env <- nlevels(ComBLUPSdata$ENV)
-n_rep <- 2   # reps per environment — edit if this differs from your design
+n_rep <- 2   # reps per environment — edit if this differs
 
-n_block <- ComBLUPSdata %>%
-  distinct(ENV, REP, BLOCK) %>%
-  nrow() %>%
-  {. / (n_env * n_rep)}   # blocks per REP per ENV (assumes equal block count throughout)
+get_varcomp_h2 <- function(model, trait) {
+  vc <- as.data.frame(VarCorr(model))
+  Vg     <- vc$vcov[vc$grp == "GENOTYPE"]
+  Vge    <- vc$vcov[vc$grp == "GENOTYPE:ENV"]
+  Ve     <- attr(VarCorr(model), "sc")^2
+  Vrep   <- vc$vcov[vc$grp == "REP"]
+  Vblock <- vc$vcov[vc$grp == "BLOCK"]
 
-####################################################################
-## ---- 1. Calculate repeatability from varcomp_summary ------------
-##    (Vg, Vge, Vrep, Vblock, Ve already present per trait)
-####################################################################
+  H2 <- Vg / (Vg + Vge / n_env + Ve / (n_env * n_rep))
 
-repeatability_summary <- varcomp_summary %>%
-  mutate(
-    R_plot_basis = Vg / (Vg + Vge + Vblock + Vrep + Ve),
-    R_entry_mean = Vg / (Vg + Vge / n_env + Vblock / (n_env * n_block) + Ve / (n_env * n_rep))
-  ) %>%
-  dplyr::select(Trait, Vg, Vge, Vrep, Vblock, Ve,
-                R_plot_basis, R_entry_mean, H2_standard)
-
-print(repeatability_summary)
-write_csv(repeatability_summary, "repeatability_combined_multienv.csv")
-
-####################################################################
-##-----  2. Compare R_entry_mean against H2_broad_sense (sanity check) ----------
-####################################################################
-## NB: These two should be close but not identical, since R_entry_mean
-## additionally accounts for block variance (Vblock), while H2_broad_sense (as
-## calculated in the MET script) does not. A trait with near-zero
-## Vblock should show R_entry_mean ≈ H2_broad_sense (i.e.,nearly identical,
-## block variance was negligible there); But a trait with substantial Vblock will 
-## show R_entry_mean slightly lower,hence shows a big gap between the two, 
-## that's telling you blocking captured meaningful variation for that trait  since 
-## it's accounting for an extra source of noise H2_broad_sense ignores.
-
-comparison <- repeatability_summary %>%
-  mutate(Difference = R_entry_mean - H2_broad_sense) %>%
-  dplyr::select(Trait, R_entry_mean, H2_broad_sense, Difference)
-
-print(comparison)
-write_csv(comparison, "repeatability_vs_H2_comparison.csv")
-
-####################################################################
-## Notes
-####################################################################
-# 1. R_plot_basis reflects how noisy a SINGLE plot observation is,
-#    before any benefit from averaging across reps/blocks/environments
-#    — relevant if you're deciding how many reps/environments you'd
-#    need for a future trial of this genotype panel.
-#
-# 2. R_entry_mean reflects the reliability of the actual combined
-#    BLUP you'd report/use for selection — the number that matters
-#    most for interpreting genotype_blups_wide.
-#
-# 3. A trait with Vg = 0 (no detectable genetic variance — same
-#    situation as EPP in the single-trial data) will show R = 0 for
-#    both versions here, for the same reason as before: no genetic
-#    signal means no repeatability to estimate, not a coding error.
-#
-# 4. n_block assumes an EQUAL number of blocks per REP per ENV across
-#    your whole trial. If block count differs between environments or
-#    reps, this average approximation is still commonly used, but
-#    treat R_entry_mean as an approximate value in that case rather
-#    than an exact one.
-
-
-#==========================================================================
-####################################################################
-## Base Index (BI) for selection under drought stress
-## Badu-Apraku et al. multiple-trait-based selection index:
-##   BI = (2 x YIELD) + EPP - ASI - PASP - EASP - STYG
-##
-## Provided for BOTH:
-##   (a) a single trial's genotype BLUPs
-##   (b) combined across-environment (multi-trial) genotype BLUPs
-##
-## Run AFTER you have a genotype BLUP wide table already built —
-## either `genotype_blups_wide` from the single-trial script, or
-## the combined-BLUP wide table from the multi-environment script.
-####################################################################
-
-library(tidyverse)
-
-## ---- Trait direction reminder (Badu-Apraku index) ------------------
-## YIELD - grain yield: HIGHER is better  -> positive weight, doubled
-##         (yield is given double weight, reflecting its primary
-##         importance as a selection target)
-## EPP   - ears per plant: HIGHER is better -> positive weight
-## ASI   - anthesis-silking interval: LOWER is better (shorter ASI =
-##         less drought-induced flowering asynchrony) -> negative weight
-## PASP  - plant aspect score: LOWER is better (visual score, lower
-##         score = healthier/more desirable plant type) -> negative weight
-## EASP  - ear aspect score: LOWER is better (same logic as PASP)
-##         -> negative weight
-## STYG  - stay-green / senescence score: LOWER is better (lower score
-##         = more stress tolerance, e.g. greener at maturity)
-##         -> negative weight
-##
-## IMPORTANT: double-check these directions and the exact scoring
-## scale (e.g., 1-9 vs 1-5) used in YOUR dataset before trusting the
-## sign convention below — visual scores are sometimes coded in the
-## opposite direction depending on the scoring sheet used.
-
-####################################################################
-## 1. Reusable function: standardize traits + compute BI + rank
-####################################################################
-## Traits are standardized (converted to Z-scores: mean 0, SD 1)
-## before combining, since YIELD (t/ha), EPP (count), and the
-## aspect/ASI scores (small integer scales) are on completely
-## different measurement scales — combining raw values directly
-## would let whichever trait has the largest numeric range dominate
-## the index regardless of its actual importance.
-
-####################################################################
-## 2a. SINGLE TRIAL — apply to genotype_blups_wide
-####################################################################
-## Assumes `genotype_blups_wide` already exists from your single-trial
-## script, with columns: Genotype, YIELD, EPP, ASI, PASP, EASP, STYG,
-## (plus any other traits you fitted — extra columns are fine, only
-## the 6 required ones are used).
-
-calculate_BI <- function(blup_data, genotype_col = "Genotype") {
-  
-  required_traits <- c("YIELD", "EPP", "ASI", "PASP", "EASP", "STYG")
- 
-  missing_cols <- setdiff(required_traits, colnames(blup_data))
-  if (length(missing_cols) > 0) {
-    stop("Missing required trait columns: ", paste(missing_cols, collapse = ", "),
-         "\nCheck your column names match exactly (case-sensitive).")
-  }
-  
-  z_data <- blup_data %>%
-    mutate(across(all_of(required_traits),
-                  ~ {
-                    s <- sd(.x, na.rm = TRUE)
-                    # Guard against a trait with zero genetic variance
-                    # (SD = 0 -> scale() would return NA for every row,
-                    # which would poison the whole BI sum). A trait
-                    # that doesn't vary across genotypes contributes no
-                    # discriminating information anyway, so it's treated
-                    # as contributing exactly 0 rather than breaking BI.
-                    if (is.na(s) || s == 0) rep(0, length(.x)) else as.numeric(scale(.x))
- },
-                  .names = "Z_{.col}"))
-  
-  z_data %>%
-    mutate(
-      BI = (2 * Z_YIELD) + Z_EPP - Z_ASI - Z_PASP - Z_EASP - Z_STYG,
-      BI_Rank = rank(-BI, ties.method = "min"),   # rank 1 = best (highest BI)
-      Stress_Response = if_else(BI > 0, "Tolerant", "Susceptible")
-      # Per Badu-Apraku et al.: positive BI = tolerant to the applied
-      # stress; negative BI = susceptible. BI == 0 (rare) falls under
-      # "Susceptible" here since if_else uses BI > 0 strictly — adjust
-      # if you'd rather treat exactly 0 as a separate/neutral category.
-    ) %>%
-    arrange(BI_Rank) %>%
-    dplyr::select(all_of(genotype_col), all_of(required_traits),
-                  starts_with("Z_"), BI, BI_Rank, Stress_Response)
+  tibble(Trait = trait, Vg = Vg, Vge = Vge, Vrep = Vrep,
+         Vblock = Vblock, Ve = Ve, H2_broad_sense = H2)
 }
 
-BI_single_trial <- calculate_BI(genotype_blups_wide)
-
-print(BI_single_trial)
-write_csv(BI_single_trial, "BaseIndex_BI_single_trial.csv")
-
-####################################################################
-## 2b. MULTIPLE TRIALS (combined across-environment BLUPs)
-####################################################################
-## Assumes you have a combined-BLUP wide table from the multi-
-## environment script — e.g. `genotype_blups_wide` from that script
-## (rename here to avoid clashing with the single-trial object above
-## if both are in the same R session).
-
-# Example: if your combined multi-environment wide table is called
-# `combined_genotype_blups_wide`, rename it below to match:
-# combined_genotype_blups_wide <- genotype_blups_wide   # (from the MET script)
-
-BI_multi_trial <- calculate_BI(combined_genotype_blups_wide)
-
-print(BI_multi_trial)
-write_csv(BI_multi_trial, "BaseIndex_BI_combined_multitrial.csv")
+varcomp_summary <- map2_dfr(lmer_fits, trait_names, get_varcomp_h2)
+write_csv(varcomp_summary, "variance_components_H2.csv")
+print(varcomp_summary)
 
 ####################################################################
-## 3. Optional: compare single-trial vs combined BI rankings
-####################################################################
-## Useful to see whether top genotypes selected from one trial alone
-## agree with their ranking once multi-environment data is pooled —
-## large disagreements flag genotypes whose apparent performance in
-## a single trial may not hold up as true, stable drought tolerance.
-
-BI_comparison <- BI_single_trial %>%
-  dplyr::select(Genotype, BI_SingleTrial = BI, Rank_SingleTrial = BI_Rank) %>%
-  full_join(
-    BI_multi_trial %>%
-      dplyr::select(Genotype, BI_Combined = BI, Rank_Combined = BI_Rank),
-    by = "Genotype"
-  ) %>%
-  arrange(Rank_Combined)
-
-write_csv(BI_comparison, "BaseIndex_BI_comparison_single_vs_combined.csv")
-print(BI_comparison)
-
-####################################################################
-## Notes
-####################################################################
-# 1. Interpretation (per Badu-Apraku et al.): a POSITIVE BI indicates
-#    tolerance to the applied stress (e.g., drought); a NEGATIVE BI
-#    indicates susceptibility. The Stress_Response column applies
-#    this directly, but always sanity-check a handful of your top-
-#    and bottom-ranked genotypes against their raw trait values to
-#    confirm the classification matches your agronomic expectations.
-#
-# 2. Z-scores are calculated WITHIN each dataset separately (single
-#    trial standardized against itself; combined BLUPs standardized
-#    against themselves) — this is standard practice, since the point
-#    is relative ranking of genotypes within a given evaluation, not
-#    comparing raw index values across different trials/datasets.
-#
-# 3. If any of the 6 required trait columns is missing or misspelled
-#    in your BLUP table, calculate_BI() will stop with a clear message
-#    listing exactly which column(s) it couldn't find — check spelling/
-#    capitalization against your actual trait_names first (same class
-#    of issue we've hit repeatedly with Genotype/GENOTYPE case).
-#
-# 4. If ASI, PASP, EASP, or STYG in your dataset are scored on a scale
-#    where a HIGHER number is actually better (opposite of what's
-#    assumed here), flip the sign for that term in the BI formula
-#    inside calculate_BI() accordingly — the formula's signs only make
-#    sense given the "lower is better" scoring convention noted above.
-#
-# 5. A trait with zero genetic variance (SD = 0 across genotypes, e.g.
-#    EPP in this trial) is treated as contributing Z = 0 rather than
-#    breaking the whole BI calculation with NA — see the guard inside
-#    calculate_BI(). This is a reasonable fallback, but also worth
-#    flagging in any write-up: that trait added no discriminating
-#    power to the index for this particular trial.
-#============================================================================
-
-
-####################################################################
-## 5. Ranked GENOTYPE table (single trial)
-####################################################################
-## EDIT to match your actual breeding objective per trait (see note
-## in the multi-environment ranking script — same principle applies).
-trait_direction <- tibble::tribble(
-  ~Trait,        ~higher_is_better,
-  "YIELD",         TRUE,
-  "PLHT",          TRUE,
-  "EHT",           TRUE,
-  "POLLEN",        FALSE,
-  "SILK",          FALSE,
-  "ASI",           FALSE,
-  "STYG",          FALSE,
-  "PASP",          FALSE,
-  "HUSKC",         FALSE,
-  "RLPERC",        FALSE,
-  "SLPERC",        FALSE,
-  "EPP",           TRUE,
-  "EASP",          FALSE,
-  "EROT",          FALSE,            
-)
-
-ranked_blups <- genotype_blups_all %>%
-  left_join(trait_direction, by = "Trait") %>%
-  mutate(higher_is_better = replace_na(higher_is_better, TRUE)) %>%
-  group_by(Trait) %>%
-  mutate(Rank = if_else(higher_is_better,
-                        rank(-BLUP_value, ties.method = "min"),
-                        rank(BLUP_value,  ties.method = "min"))) %>%
-  ungroup() %>%
-  dplyr::select(-higher_is_better)
-
-write_csv(ranked_blups, "genotype_BLUPs_single_trial_ranked_long.csv")
-
-ranked_wide <- ranked_blups %>%
-  dplyr::select(Genotype, Trait, BLUP_value, Rank) %>%
-  pivot_wider(names_from = Trait, values_from = c(BLUP_value, Rank),
-              names_glue = "{Trait}_{.value}")
-write_csv(ranked_wide, "genotype_BLUPs_single_trial_ranked_wide.csv")
-
-####################################################################
-## 6. Alternative engine: sommer (often more stable for small,
-##    unbalanced alpha-lattice trials; gives heritability directly)
+## APPROACH B: sommer — same model, often more stable for unbalanced
+## alpha-lattice designs and gives heritability directly
 ####################################################################
 
 fit_sommer_one_trait <- function(trait, data) {
   data$y <- data[[trait]]
   mmer(
-    y ~ REP,
-    random = ~ BLOCK + GENOTYPE,
+    y ~ ENV,
+    random = ~ REP + BLOCK + GENOTYPE + GENOTYPE:ENV,
     rcov   = ~ units,
     data   = data,
     verbose = FALSE
   )
 }
 
-sommer_fits <- map(trait_names, ~ fit_sommer_one_trait(.x, SingleBLUPSdata)) %>%
+sommer_fits <- map(trait_names, ~ fit_sommer_one_trait(.x, ComBLUPSdata)) %>%
   set_names(trait_names)
 
-get_sommer_blups_h2 <- function(model, trait, n_REP) {
-  u <- model$U$Genotype$y
-  vc <- summary(model)$varcomp
-  Vg <- vc["Genotype", "VarComp"]
-  Ve <- vc["units", "VarComp"]
-  H2 <- Vg / (Vg + Ve / n_REP)
-  list(
-    blups = tibble(Genotype = names(u), Trait = trait, BLUP_deviation = as.numeric(u)),
-    h2    = tibble(Trait = trait, Vg = Vg, Ve = Ve, H2_standard = H2)
-  )
+get_sommer_blups <- function(model, trait) {
+  u <- model$U$GENOTYPE$y
+  tibble(Genotype = names(u), Trait = trait, BLUP_deviation = as.numeric(u))
 }
 
-sommer_results <- map2(sommer_fits, trait_names, ~ get_sommer_blups_h2(.x, .y, n_REP))
-sommer_blups   <- map_SingleBLUPSdatar(sommer_results, "blups")
-sommer_h2      <- map_SingleBLUPSdatar(sommer_results, "h2")
+sommer_blups_all <- map2_dfr(sommer_fits, trait_names, get_sommer_blups)
 
-write_csv(sommer_blups, "sommer_GENOTYPE_BLUPs_single_trial.csv")
-write_csv(sommer_h2,    "sommer_H2_single_trial.csv")
+get_sommer_h2_safe <- function(model, trait, n_env, n_rep) {
+  vc <- summary(model)$varcomp
+  Vg  <- vc["GENOTYPE",     "VarComp"]
+  Vge <- vc["GENOTYPE:ENV", "VarComp"]
+  Ve  <- vc["units",        "VarComp"]
+  H2 <- Vg / (Vg + Vge / n_env + Ve / (n_env * n_rep))
+  tibble(Trait = trait, Vg = Vg, Vge = Vge, Ve = Ve, H2 = H2)
+}
+
+sommer_h2_summary <- map2_dfr(sommer_fits, trait_names,
+                               ~ get_sommer_h2_safe(.x, .y, n_env, n_rep))
+write_csv(sommer_h2_summary, "sommer_H2_summary.csv")
+
+####################################################################
+## Optional: single-environment (within-year) BLUPs, if also needed
+####################################################################
+
+fit_within_env <- function(trait, env_level, data) {
+  d <- filter(data, ENV == env_level)
+  f <- as.formula(paste0(trait, " ~ (1|REP) + (1|BLOCK) + (1|GENOTYPE)"))
+  lmer(f, data = d, REML = TRUE)
+}
+
+within_env_blups <- expand_grid(Trait = trait_names, ENV = levels(ComBLUPSdata$ENV)) %>%
+  pmap_dfr(function(Trait, ENV) {
+    m  <- fit_within_env(Trait, ENV, ComBLUPSdata)
+    re <- ranef(m)$GENOTYPE
+    tibble(Genotype = rownames(re), Env = ENV, Trait = Trait,
+           BLUP_value = fixef(m)[["(Intercept)"]] + re[, 1])
+  })
+
+write_csv(within_env_blups, "within_environment_BLUPs.csv")
 
 ####################################################################
 ## Notes
 ####################################################################
-# 1. REP as fixed vs random: with only 2 REPs, REP is conventionally
-#    treated as fixed in single-trial alpha-lattice analysis (as coded
-#    here) since 2 levels give an unreliable variance-component estimate
-#    if treated as random. This does not affect the GENOTYPE BLUPs.
+# 1. Convergence: check convergence_check (built above) before
+#    trusting results. isSingular() flags variance components (often
+#    BLOCK or REP) estimated at ~0 — common in smaller alpha-lattice
+#    designs, not necessarily an error.
 #
-# 2. If a trait shows isSingular(model) == TRUE, the BLOCK variance is
-#    likely ~0 for that trait — inspect whether a simpler model without
-#    BLOCK fits equally well (anova/AIC). BLUPs are still usable either way.
+# 2. If BLOCK variance is ~0 for a trait, blocking added little
+#    information there — BLUPs are still valid; compare against a
+#    simpler model without BLOCK via anova()/AIC if you want to check.
 #
-# 3. Cullis heritability (H2_Cullis) is generally preferred over the
-#    standard formula for alpha-lattice designs because GENOTYPEs are
-#    not equally well-connected across incomplete BLOCKs, so their
-#    individual prediction error variances differ — the standard formula
-#    implicitly assumes they don't.
+# 3. GENOTYPE:ENV as random assumes genotype BLUPs should be shrunk
+#    toward the across-environment mean under a common GxE variance.
+#    For environment-specific predictions instead, use
+#    within_env_blups above, or ranef(model)$`GENOTYPE:ENV` from the
+#    combined model.
+#
+# 4. For very unbalanced/small blocks, sommer or ASReml-R generally
+#    handle alpha-lattice structure more robustly than lme4 — compare
+#    genotype_blups_all against sommer_blups_all as a cross-check.
+#
+# 5. All select() calls use dplyr:: explicitly, since MASS (loaded as
+#    a dependency of lme4/sommer) defines its own select() that would
+#    otherwise silently override dplyr's and cause an "unused
+#    arguments" error.
